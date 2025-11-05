@@ -8,7 +8,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { autenticarToken, apenasTecnicos } = require('./authMiddleware');
 const multer = require('multer');
-const path = require('path'); 
+const path = require('path');
 
 // --- (Configuração do Multer) ---
 const storage = multer.diskStorage({
@@ -21,26 +21,86 @@ const upload = multer({ storage: storage });
 const app = express();
 const PORT = 3000;
 
-// --- AQUI ESTÁ A CORREÇÃO ---
-// Configuração de CORS mais explícita para lidar com pre-flight (OPTIONS)
-// Isto substitui o app.use(cors()) simples.
+// CORS explícito
 app.use(cors({
-  origin: 'http://localhost:4200', // Permite APENAS o seu Angular
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], // Permite estes métodos
-  allowedHeaders: ['Content-Type', 'Authorization'] // Permite estes headers
+  origin: 'http://localhost:4200',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-app.use(express.json()); 
+app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ========================================================
+// SOCKET.IO (tempo real)
+// ========================================================
+const http = require('http');
+const { Server } = require('socket.io');
 
-// --- ROTAS DA API (VÊM PRIMEIRO) ---
+// Cria servidor HTTP e conecta o Express nele
+const server = http.createServer(app);
+
+// Configura Socket.IO
+const io = new Server(server, {
+  cors: {
+    origin: 'http://localhost:4200',
+    methods: ['GET', 'POST']
+  }
+});
+
+// Armazena conexões por usuário (userId -> socketId)
+const clientesConectados = new Map();
+
+/**
+ * O cliente (Angular) deve emitir após login:
+ * socket.emit('registrarUsuario', userId);
+ */
+io.on('connection', (socket) => {
+  console.log('✅ WebSocket conectado:', socket.id);
+
+  socket.on('registrarUsuario', (userId) => {
+    if (!userId) return;
+    clientesConectados.set(Number(userId), socket.id);
+    console.log(`🔗 userId ${userId} associado ao socket ${socket.id}`);
+  });
+
+  socket.on('disconnect', () => {
+    for (const [userId, sockId] of clientesConectados.entries()) {
+      if (sockId === socket.id) {
+        clientesConectados.delete(userId);
+        break;
+      }
+    }
+    console.log('❌ WebSocket desconectado:', socket.id);
+  });
+});
+
+// Helpers para emitir eventos
+function enviarParaUsuario(userId, evento, dados) {
+  const socketId = clientesConectados.get(Number(userId));
+  if (socketId) {
+    io.to(socketId).emit(evento, dados);
+  }
+}
+
+async function enviarParaTecnicos(evento, dados) {
+  try {
+    const [rows] = await pool.query("SELECT id FROM perfis WHERE nivel IN ('tecnico','admin')");
+    rows.forEach(r => enviarParaUsuario(r.id, evento, dados));
+  } catch (e) {
+    console.error('Erro ao emitir para técnicos:', e?.message || e);
+  }
+}
+
+// ========================================================
+// ROTAS DA API (VÊM PRIMEIRO)
+// ========================================================
 
 // GET /api/chamados (ATUALIZADO COM JOIN)
 app.get('/api/chamados', autenticarToken, async (req, res) => {
   const usuario = req.usuario;
-  const { status } = req.query; 
+  const { status } = req.query;
   try {
     let sql;
     let params = [];
@@ -52,26 +112,27 @@ app.get('/api/chamados', autenticarToken, async (req, res) => {
       JOIN perfis p ON c.criado_por_id = p.id
     `;
     let conditions = [];
-    if (usuario.nivel === 'tecnico' || usuario.nivel === 'admin') {
-      // Visão TI
-    } else {
-      // Visão Funcionário
+
+    if (!(usuario.nivel === 'tecnico' || usuario.nivel === 'admin')) {
+      // Visão Funcionário: vê só os seus
       conditions.push('c.criado_por_id = ?');
       params.push(usuario.id);
     }
+
     if (status) {
       conditions.push('c.status = ?');
       params.push(status);
     }
+
     if (conditions.length > 0) {
       sql = baseQuery + ' WHERE ' + conditions.join(' AND ');
     } else {
       sql = baseQuery;
     }
+
     sql += ' ORDER BY c.criado_em DESC';
-    console.log(`Executando SQL: ${sql.replace(/\s+/g, ' ')} com parâmetros: [${params.join(', ')}]`);
+
     const [rows] = await pool.query(sql, params);
-    console.log(`Query executada, ${rows.length} chamados encontrados (Filtro: ${status || 'nenhum'}).`);
     res.json(rows);
   } catch (err) {
     console.error('Erro ao buscar chamados:', err);
@@ -79,7 +140,7 @@ app.get('/api/chamados', autenticarToken, async (req, res) => {
   }
 });
 
-// GET /api/chamado/:id
+// GET /api/chamado/:id (liberado: funcionário só vê os dele)
 app.get('/api/chamado/:id', autenticarToken, async (req, res) => {
   const chamadoId = req.params.id;
   const usuario = req.usuario;
@@ -105,13 +166,12 @@ app.get('/api/chamado/:id', autenticarToken, async (req, res) => {
 
     const chamado = rows[0];
 
-    // ✅ Funcionário só pode ver chamado que ele criou
+    // Funcionário só pode ver chamado que ele criou
     if (usuario.nivel === 'funcionario' && chamado.criado_por_id !== usuario.id) {
       return res.status(403).json({ message: 'Acesso negado: este chamado não pertence a você.' });
     }
 
     res.json(chamado);
-
   } catch (err) {
     console.error('Erro ao buscar detalhe do chamado:', err);
     res.status(500).json({ message: 'Erro ao buscar dados' });
@@ -120,11 +180,9 @@ app.get('/api/chamado/:id', autenticarToken, async (req, res) => {
 
 // GET /api/tecnicos
 app.get('/api/tecnicos', autenticarToken, apenasTecnicos, async (req, res) => {
-  console.log('Recebida requisição para GET /api/tecnicos'); 
   try {
     const sql = "SELECT id, nome_completo FROM perfis WHERE nivel = 'tecnico' OR nivel = 'admin' ORDER BY nome_completo";
     const [rows] = await pool.query(sql);
-    console.log(`Encontrados ${rows.length} técnicos.`); 
     res.json(rows);
   } catch (err) {
     console.error('Erro ao buscar técnicos:', err);
@@ -132,11 +190,11 @@ app.get('/api/tecnicos', autenticarToken, apenasTecnicos, async (req, res) => {
   }
 });
 
-// POST /api/chamado (com upload)
+// POST /api/chamado (com upload) -> emite "novo-chamado" para técnicos
 app.post('/api/chamado', autenticarToken, upload.single('anexo'), async (req, res) => {
   try {
     const { titulo, descricao } = req.body;
-    const criado_por_id = req.usuario.id; 
+    const criado_por_id = req.usuario.id;
     let anexo_url = null;
     if (req.file) {
       anexo_url = `http://localhost:3000/uploads/${req.file.filename}`;
@@ -148,7 +206,18 @@ app.post('/api/chamado', autenticarToken, upload.single('anexo'), async (req, re
     const params = [titulo, descricao, criado_por_id, anexo_url];
     const [result] = await pool.query(sql, params);
     const [novoChamadoRows] = await pool.query('SELECT * FROM chamados WHERE id = ?', [result.insertId]);
-    res.status(201).json(novoChamadoRows[0]);
+    const novoChamado = novoChamadoRows[0];
+
+    // ⚡ Tempo real: notifica todos técnicos
+    await enviarParaTecnicos('novo-chamado', {
+      id: novoChamado.id,
+      titulo: novoChamado.titulo,
+      criado_por_id,
+      criado_em: novoChamado.criado_em,
+      status: novoChamado.status
+    });
+
+    res.status(201).json(novoChamado);
   } catch (err) {
     console.error('Erro ao criar chamado:', err);
     res.status(500).json({ message: 'Erro ao salvar dados' });
@@ -156,9 +225,11 @@ app.post('/api/chamado', autenticarToken, upload.single('anexo'), async (req, re
 });
 
 // --- AÇÕES DE TÉCNICO (PUT) ---
+
+// PUT /api/chamados/:id/atribuir -> emite "chamado-atribuido" para o técnico escolhido
 app.put('/api/chamados/:id/atribuir', autenticarToken, apenasTecnicos, async (req, res) => {
   const chamadoId = req.params.id;
-  const { tecnicoId } = req.body; 
+  const { tecnicoId } = req.body;
   if (!tecnicoId) {
     return res.status(400).json({ message: 'ID do técnico é obrigatório.' });
   }
@@ -169,6 +240,10 @@ app.put('/api/chamados/:id/atribuir', autenticarToken, apenasTecnicos, async (re
       WHERE id = ?
     `;
     await pool.query(sql, [tecnicoId, chamadoId]);
+
+    // ⚡ Tempo real: notifica apenas o técnico atribuído
+    enviarParaUsuario(tecnicoId, 'chamado-atribuido', { chamadoId: Number(chamadoId) });
+
     res.json({ message: 'Chamado atribuído com sucesso!' });
   } catch (err) {
     console.error('Erro ao atribuir chamado:', err);
@@ -176,12 +251,24 @@ app.put('/api/chamados/:id/atribuir', autenticarToken, apenasTecnicos, async (re
   }
 });
 
+// PUT /api/chamados/:id/status -> emite "status-alterado" para criador e técnico
 app.put('/api/chamados/:id/status', autenticarToken, apenasTecnicos, async (req, res) => {
   const chamadoId = req.params.id;
   const { novoStatus } = req.body;
   try {
     const sql = 'UPDATE chamados SET status = ? WHERE id = ?';
     await pool.query(sql, [novoStatus, chamadoId]);
+
+    // Buscar envolvidos
+    const [cRows] = await pool.query('SELECT criado_por_id, atribuido_para_id FROM chamados WHERE id = ?', [chamadoId]);
+    const criadorId = cRows[0]?.criado_por_id;
+    const tecnicoId = cRows[0]?.atribuido_para_id;
+
+    const payload = { chamadoId: Number(chamadoId), status: String(novoStatus) };
+
+    if (criadorId) enviarParaUsuario(criadorId, 'status-alterado', payload);
+    if (tecnicoId) enviarParaUsuario(tecnicoId, 'status-alterado', payload);
+
     res.json({ message: 'Status atualizado com sucesso!' });
   } catch (err) {
     console.error('Erro ao mudar status:', err);
@@ -189,6 +276,7 @@ app.put('/api/chamados/:id/status', autenticarToken, apenasTecnicos, async (req,
   }
 });
 
+// PUT /api/chamados/:id/prioridade (sem notificação por enquanto)
 app.put('/api/chamados/:id/prioridade', autenticarToken, apenasTecnicos, async (req, res) => {
   const chamadoId = req.params.id;
   const { novaPrioridade } = req.body;
@@ -274,7 +362,6 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ message: 'Email ou senha inválidos.' });
     }
 
-    // ✅ Agora o token inclui nome_completo
     const payload = {
       id: usuario.id,
       email: usuario.email,
@@ -291,13 +378,13 @@ app.post('/api/login', async (req, res) => {
     );
 
     res.json({ message: 'Login bem-sucedido!', token });
-
   } catch (err) {
     console.error('Erro no login:', err);
     res.status(500).json({ message: 'Erro interno no servidor.' });
   }
 });
 
+// Comentários: listar
 app.get('/api/chamados/:id/comentarios', autenticarToken, async (req, res) => {
   const chamadoId = req.params.id;
 
@@ -317,6 +404,7 @@ app.get('/api/chamados/:id/comentarios', autenticarToken, async (req, res) => {
   }
 });
 
+// Comentários: criar -> emite "novo-comentario" para criador e técnico
 app.post('/api/chamados/:id/comentarios', autenticarToken, async (req, res) => {
   const chamadoId = req.params.id;
   const usuarioId = req.usuario.id;
@@ -327,11 +415,38 @@ app.post('/api/chamados/:id/comentarios', autenticarToken, async (req, res) => {
   }
 
   try {
-    const sql = `
+    const insertSql = `
       INSERT INTO comentarios (texto, chamado_id, usuario_id)
       VALUES (?, ?, ?)
     `;
-    await pool.query(sql, [texto, chamadoId, usuarioId]);
+    await pool.query(insertSql, [texto, chamadoId, usuarioId]);
+
+    // Busca autor (nome + nível)
+    const [autorRows] = await pool.query(
+      'SELECT nome_completo AS autor, nivel AS autor_nivel FROM perfis WHERE id = ?',
+      [usuarioId]
+    );
+
+    // Busca envolvidos do chamado
+    const [cRows] = await pool.query(
+      'SELECT criado_por_id, atribuido_para_id FROM chamados WHERE id = ?',
+      [chamadoId]
+    );
+    const criadorId = cRows[0]?.criado_por_id;
+    const tecnicoId = cRows[0]?.atribuido_para_id;
+
+    const payload = {
+      chamadoId: Number(chamadoId),
+      texto,
+      autor: autorRows[0]?.autor || 'Usuário',
+      autor_nivel: autorRows[0]?.autor_nivel || 'funcionario',
+      criado_em: new Date()
+    };
+
+    // ⚡ Tempo real: notifica criador e técnico (bidirecional)
+    if (criadorId) enviarParaUsuario(criadorId, 'novo-comentario', payload);
+    if (tecnicoId) enviarParaUsuario(tecnicoId, 'novo-comentario', payload);
+
     res.status(201).json({ message: 'Comentário adicionado com sucesso!' });
   } catch (err) {
     console.error('🔥 ERRO AO INSERIR COMENTÁRIO:', err.code, err.sqlMessage);
@@ -339,10 +454,8 @@ app.post('/api/chamados/:id/comentarios', autenticarToken, async (req, res) => {
   }
 });
 
-
 // --- ROTA CATCH-ALL (DEVE SER A ÚLTIMA ROTA!) ---
-// Redireciona todas as outras requisições (ex: /dashboard, /login)
-// para o index.html do Angular.
+// Redireciona todas as outras requisições (ex: /dashboard, /login) para o index.html do Angular.
 app.use((req, res) => {
   const indexPath = path.join(__dirname, 'public/index.html');
   res.sendFile(indexPath, (err) => {
@@ -353,7 +466,7 @@ app.use((req, res) => {
   });
 });
 
-// Liga o servidor
-app.listen(PORT, () => {
-  console.log(`Servidor Node.js (com MySQL) rodando em http://localhost:${PORT}`);
+// --- INICIAR SERVIDOR (com WebSockets) ---
+server.listen(PORT, () => {
+  console.log(`🚀 Servidor Node.js + WebSockets rodando em http://localhost:${PORT}`);
 });
