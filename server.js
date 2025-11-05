@@ -8,85 +8,83 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { autenticarToken, apenasTecnicos } = require('./authMiddleware');
 const multer = require('multer');
-const path = require('path');
+const path = require('path'); 
 
-// --- (Configuração do Multer e Express) ---
+// --- (Configuração do Multer) ---
 const storage = multer.diskStorage({
   destination: (req, file, cb) => { cb(null, 'uploads/'); },
   filename: (req, file, cb) => { cb(null, Date.now() + '-' + file.originalname); }
 });
 const upload = multer({ storage: storage });
+
+// --- (Configuração do Express) ---
 const app = express();
 const PORT = 3000;
-app.use(cors()); 
+
+// --- AQUI ESTÁ A CORREÇÃO ---
+// Configuração de CORS mais explícita para lidar com pre-flight (OPTIONS)
+// Isto substitui o app.use(cors()) simples.
+app.use(cors({
+  origin: 'http://localhost:4200', // Permite APENAS o seu Angular
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], // Permite estes métodos
+  allowedHeaders: ['Content-Type', 'Authorization'] // Permite estes headers
+}));
+
 app.use(express.json()); 
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use(express.static(path.join(__dirname, 'public')));
 
-// --- API ENDPOINTS (DADOS) ---
 
-// (GET /api/chamados - continua igual)
+// --- ROTAS DA API (VÊM PRIMEIRO) ---
+
+// GET /api/chamados (ATUALIZADO COM JOIN)
 app.get('/api/chamados', autenticarToken, async (req, res) => {
   const usuario = req.usuario;
-  
-  // 1. LÊ O PARÂMETRO DA URL
   const { status } = req.query; 
-
   try {
     let sql;
     let params = [];
-
-    // ... (lógica de if/else para 'tecnico' vs 'funcionario') ...
+    let baseQuery = `
+      SELECT 
+        c.*, 
+        p.nome_completo as solicitante_nome 
+      FROM chamados c
+      JOIN perfis p ON c.criado_por_id = p.id
+    `;
+    let conditions = [];
     if (usuario.nivel === 'tecnico' || usuario.nivel === 'admin') {
-      console.log(`[Visão TI] Buscando chamados...`);
-      sql = 'SELECT * FROM chamados';
-      
-      // 2. ADICIONA O FILTRO (SE EXISTIR)
-      if (status) {
-        sql += ' WHERE status = ?';
-        params.push(status);
-      } else {
-        // --- ESTA PODE SER A CORREÇÃO ---
-        // Se o seu filtro padrão é 'aberto',
-        // talvez a lógica para 'todos' esteja errada.
-        // Vamos garantir que se 'status' for uma string vazia, não filtramos.
-      }
-
+      // Visão TI
     } else {
-      // Lógica do Funcionário
-      console.log(`[Visão Funcionário] Buscando chamados do usuário ${usuario.id}...`);
-      sql = 'SELECT * FROM chamados WHERE criado_por_id = ?';
+      // Visão Funcionário
+      conditions.push('c.criado_por_id = ?');
       params.push(usuario.id);
-
-      // 3. ADICIONA O FILTRO DE STATUS (SE EXISTIR)
-      if (status) {
-        sql += ' AND status = ?';
-        params.push(status);
-      }
     }
-
-    // 4. Adiciona a ordenação
-    sql += ' ORDER BY criado_em DESC';
-
-    // 5. Log de depuração
-    console.log(`Executando SQL: ${sql} com parâmetros: [${params.join(', ')}]`);
-    
+    if (status) {
+      conditions.push('c.status = ?');
+      params.push(status);
+    }
+    if (conditions.length > 0) {
+      sql = baseQuery + ' WHERE ' + conditions.join(' AND ');
+    } else {
+      sql = baseQuery;
+    }
+    sql += ' ORDER BY c.criado_em DESC';
+    console.log(`Executando SQL: ${sql.replace(/\s+/g, ' ')} com parâmetros: [${params.join(', ')}]`);
     const [rows] = await pool.query(sql, params);
-    
     console.log(`Query executada, ${rows.length} chamados encontrados (Filtro: ${status || 'nenhum'}).`);
-    
     res.json(rows);
-
   } catch (err) {
     console.error('Erro ao buscar chamados:', err);
     res.status(500).json({ message: 'Erro ao buscar dados' });
   }
 });
 
-// GET /api/chamado/:id (ATUALIZADO COM JOIN PARA NOME DO TÉCNICO)
-app.get('/api/chamado/:id', autenticarToken, apenasTecnicos, async (req, res) => {
+// GET /api/chamado/:id
+app.get('/api/chamado/:id', autenticarToken, async (req, res) => {
   const chamadoId = req.params.id;
+  const usuario = req.usuario;
+
   try {
-    // Adicionámos um SEGUNDO JOIN (p_tecnico) para buscar o nome do técnico atribuído
     const sql = `
       SELECT 
         c.*, 
@@ -104,34 +102,38 @@ app.get('/api/chamado/:id', autenticarToken, apenasTecnicos, async (req, res) =>
     if (rows.length === 0) {
       return res.status(404).json({ message: 'Chamado não encontrado.' });
     }
-    res.json(rows[0]);
+
+    const chamado = rows[0];
+
+    // ✅ Funcionário só pode ver chamado que ele criou
+    if (usuario.nivel === 'funcionario' && chamado.criado_por_id !== usuario.id) {
+      return res.status(403).json({ message: 'Acesso negado: este chamado não pertence a você.' });
+    }
+
+    res.json(chamado);
+
   } catch (err) {
     console.error('Erro ao buscar detalhe do chamado:', err);
     res.status(500).json({ message: 'Erro ao buscar dados' });
   }
 });
 
-// --- ROTA NOVA PARA BUSCAR A LISTA DE TÉCNICOS ---
+// GET /api/tecnicos
 app.get('/api/tecnicos', autenticarToken, apenasTecnicos, async (req, res) => {
-  console.log('Recebida requisição para GET /api/tecnicos'); // Log de depuração
+  console.log('Recebida requisição para GET /api/tecnicos'); 
   try {
-    // Query correta: Busca ID e nome_completo da tabela PERFIS
-    // onde o nível é 'tecnico' OU 'admin'
     const sql = "SELECT id, nome_completo FROM perfis WHERE nivel = 'tecnico' OR nivel = 'admin' ORDER BY nome_completo";
-    
     const [rows] = await pool.query(sql);
-    
-    console.log(`Encontrados ${rows.length} técnicos.`); // Log de depuração
+    console.log(`Encontrados ${rows.length} técnicos.`); 
     res.json(rows);
-
   } catch (err) {
     console.error('Erro ao buscar técnicos:', err);
     res.status(500).json({ message: 'Erro ao buscar dados' });
   }
 });
+
 // POST /api/chamado (com upload)
 app.post('/api/chamado', autenticarToken, upload.single('anexo'), async (req, res) => {
-  // ... (o seu código de criar chamado continua igual)
   try {
     const { titulo, descricao } = req.body;
     const criado_por_id = req.usuario.id; 
@@ -154,17 +156,12 @@ app.post('/api/chamado', autenticarToken, upload.single('anexo'), async (req, re
 });
 
 // --- AÇÕES DE TÉCNICO (PUT) ---
-
-// PUT /api/chamados/:id/atribuir (ATUALIZADO)
-// Agora espera um 'tecnicoId' no corpo da requisição
 app.put('/api/chamados/:id/atribuir', autenticarToken, apenasTecnicos, async (req, res) => {
   const chamadoId = req.params.id;
-  const { tecnicoId } = req.body; // Pega o ID do técnico selecionado no dropdown
-
+  const { tecnicoId } = req.body; 
   if (!tecnicoId) {
     return res.status(400).json({ message: 'ID do técnico é obrigatório.' });
   }
-
   try {
     const sql = `
       UPDATE chamados 
@@ -179,8 +176,6 @@ app.put('/api/chamados/:id/atribuir', autenticarToken, apenasTecnicos, async (re
   }
 });
 
-// (O resto do seu server.js: /status, /register, /login, app.listen)
-// ...
 app.put('/api/chamados/:id/status', autenticarToken, apenasTecnicos, async (req, res) => {
   const chamadoId = req.params.id;
   const { novoStatus } = req.body;
@@ -194,8 +189,24 @@ app.put('/api/chamados/:id/status', autenticarToken, apenasTecnicos, async (req,
   }
 });
 
+app.put('/api/chamados/:id/prioridade', autenticarToken, apenasTecnicos, async (req, res) => {
+  const chamadoId = req.params.id;
+  const { novaPrioridade } = req.body;
+  if (!novaPrioridade) {
+    return res.status(400).json({ message: 'Nova prioridade é obrigatória.' });
+  }
+  try {
+    const sql = 'UPDATE chamados SET prioridade = ? WHERE id = ?';
+    await pool.query(sql, [novaPrioridade, chamadoId]);
+    res.json({ message: 'Prioridade atualizada com sucesso!' });
+  } catch (err) {
+    console.error('Erro ao mudar prioridade:', err);
+    res.status(500).json({ message: 'Erro ao salvar dados' });
+  }
+});
+
+// --- ENDPOINTS DE AUTENTICAÇÃO ---
 app.post('/api/register', async (req, res) => {
-  // ... (código de registro)
   const { email, pass, nomeCompleto, setor, cargo } = req.body;
   if (!email || !pass || !nomeCompleto || !setor || !cargo) {
     return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
@@ -231,46 +242,118 @@ app.post('/api/register', async (req, res) => {
 });
 
 app.post('/api/login', async (req, res) => {
-  // ... (código de login)
   const { email, pass } = req.body;
+
   if (!email || !pass) {
     return res.status(400).json({ message: 'Email e senha são obrigatórios.' });
   }
+
   try {
     const [rows] = await pool.query(
-      `SELECT u.id, u.email, u.senha_hash, p.nivel, p.setor_texto, p.cargo_texto 
+      `SELECT 
+         u.id, 
+         u.email, 
+         u.senha_hash, 
+         p.nome_completo,
+         p.nivel, 
+         p.setor_texto, 
+         p.cargo_texto 
        FROM usuarios u
        JOIN perfis p ON u.id = p.id
        WHERE u.email = ?`,
       [email]
     );
+
     if (rows.length === 0) {
       return res.status(401).json({ message: 'Email ou senha inválidos.' });
     }
+
     const usuario = rows[0];
     const senhaCorreta = await bcrypt.compare(pass, usuario.senha_hash);
     if (!senhaCorreta) {
       return res.status(401).json({ message: 'Email ou senha inválidos.' });
     }
+
+    // ✅ Agora o token inclui nome_completo
     const payload = {
       id: usuario.id,
       email: usuario.email,
+      nome_completo: usuario.nome_completo,
       nivel: usuario.nivel,
       setor: usuario.setor_texto,
       cargo: usuario.cargo_texto
     };
+
     const token = jwt.sign(
-      payload, 
+      payload,
       process.env.JWT_SECRET,
       { expiresIn: '8h' }
     );
-    res.json({ message: 'Login bem-sucedido!', token: token });
+
+    res.json({ message: 'Login bem-sucedido!', token });
+
   } catch (err) {
     console.error('Erro no login:', err);
     res.status(500).json({ message: 'Erro interno no servidor.' });
   }
 });
 
+app.get('/api/chamados/:id/comentarios', autenticarToken, async (req, res) => {
+  const chamadoId = req.params.id;
+
+  try {
+    const sql = `
+      SELECT c.id, c.texto, c.criado_em, p.nome_completo AS autor, p.nivel AS autor_nivel
+      FROM comentarios c
+      JOIN perfis p ON c.usuario_id = p.id
+      WHERE c.chamado_id = ?
+      ORDER BY c.criado_em ASC
+    `;
+    const [rows] = await pool.query(sql, [chamadoId]);
+    res.json(rows);
+  } catch (err) {
+    console.error('Erro ao buscar comentários:', err);
+    res.status(500).json({ message: 'Erro ao buscar comentários' });
+  }
+});
+
+app.post('/api/chamados/:id/comentarios', autenticarToken, async (req, res) => {
+  const chamadoId = req.params.id;
+  const usuarioId = req.usuario.id;
+  const { texto } = req.body;
+
+  if (!texto || texto.trim() === '') {
+    return res.status(400).json({ message: 'O comentário não pode estar vazio.' });
+  }
+
+  try {
+    const sql = `
+      INSERT INTO comentarios (texto, chamado_id, usuario_id)
+      VALUES (?, ?, ?)
+    `;
+    await pool.query(sql, [texto, chamadoId, usuarioId]);
+    res.status(201).json({ message: 'Comentário adicionado com sucesso!' });
+  } catch (err) {
+    console.error('🔥 ERRO AO INSERIR COMENTÁRIO:', err.code, err.sqlMessage);
+    res.status(500).json({ message: 'Erro ao salvar comentário' });
+  }
+});
+
+
+// --- ROTA CATCH-ALL (DEVE SER A ÚLTIMA ROTA!) ---
+// Redireciona todas as outras requisições (ex: /dashboard, /login)
+// para o index.html do Angular.
+app.use((req, res) => {
+  const indexPath = path.join(__dirname, 'public/index.html');
+  res.sendFile(indexPath, (err) => {
+    if (err) {
+      console.error('Erro ao servir index.html:', err);
+      res.status(500).send(err);
+    }
+  });
+});
+
+// Liga o servidor
 app.listen(PORT, () => {
   console.log(`Servidor Node.js (com MySQL) rodando em http://localhost:${PORT}`);
 });
