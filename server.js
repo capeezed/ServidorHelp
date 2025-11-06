@@ -224,25 +224,122 @@ app.post('/api/chamado', autenticarToken, upload.single('anexo'), async (req, re
   }
 });
 
+app.get('/api/chamados/:id/relatorio', autenticarToken, apenasTecnicos, async (req, res) => {
+  const chamadoId = req.params.id;
+
+  try {
+    const sql = `
+      SELECT r.id, r.titulo, r.relatorio, r.criado_em,
+             p.nome_completo AS tecnico_nome
+      FROM relatorios_chamado r
+      LEFT JOIN perfis p ON p.id = r.tecnico_id
+      WHERE r.chamado_id = ?
+      ORDER BY r.criado_em DESC
+      LIMIT 1
+    `;
+    const [rows] = await pool.query(sql, [chamadoId]);
+    res.json(rows[0] || null);
+  } catch (err) {
+    console.error('Erro ao buscar relatório:', err);
+    res.status(500).json({ message: 'Erro ao buscar relatório' });
+  }
+});
+
+app.post('/api/chamados/:id/relatorio', autenticarToken, apenasTecnicos, async (req, res) => {
+  const chamadoId = Number(req.params.id);
+  const tecnicoId = req.usuario.id;
+  const { titulo, relatorio } = req.body;
+
+  if (!titulo || !titulo.trim() || !relatorio || !relatorio.trim()) {
+    return res.status(400).json({ message: 'Título e relatório são obrigatórios.' });
+  }
+
+  try {
+    // 1) Garantir que o chamado está FECHADO
+    const [chRows] = await pool.query('SELECT status FROM chamados WHERE id = ?', [chamadoId]);
+    if (!chRows.length) return res.status(404).json({ message: 'Chamado não encontrado.' });
+    if (chRows[0].status !== 'fechado') {
+      return res.status(400).json({ message: 'Só é possível registrar relatório com o chamado fechado.' });
+    }
+
+    // 2) Impedir duplicidade: um relatório por chamado
+    const [relRows] = await pool.query('SELECT id FROM relatorios_chamado WHERE chamado_id = ? LIMIT 1', [chamadoId]);
+    if (relRows.length) {
+      return res.status(409).json({ message: 'Este chamado já possui relatório final.' });
+    }
+
+    // 3) Inserir
+    const insertSql = `
+      INSERT INTO relatorios_chamado (chamado_id, tecnico_id, titulo, relatorio)
+      VALUES (?, ?, ?, ?)
+    `;
+    await pool.query(insertSql, [chamadoId, tecnicoId, titulo.trim(), relatorio.trim()]);
+
+    // 4) Retornar o último relatório
+    const [outRows] = await pool.query(
+      `SELECT r.id, r.titulo, r.relatorio, r.criado_em, p.nome_completo AS tecnico_nome
+       FROM relatorios_chamado r
+       LEFT JOIN perfis p ON p.id = r.tecnico_id
+       WHERE r.chamado_id = ?
+       ORDER BY r.criado_em DESC
+       LIMIT 1`,
+      [chamadoId]
+    );
+
+    res.status(201).json(outRows[0]);
+  } catch (err) {
+    console.error('Erro ao salvar relatório:', err);
+    res.status(500).json({ message: 'Erro ao salvar relatório' });
+  }
+});
+
 // --- AÇÕES DE TÉCNICO (PUT) ---
 
 // PUT /api/chamados/:id/atribuir -> emite "chamado-atribuido" para o técnico escolhido
 app.put('/api/chamados/:id/atribuir', autenticarToken, apenasTecnicos, async (req, res) => {
   const chamadoId = req.params.id;
   const { tecnicoId } = req.body;
+
   if (!tecnicoId) {
     return res.status(400).json({ message: 'ID do técnico é obrigatório.' });
   }
-  try {
-    const sql = `
-      UPDATE chamados 
-      SET atribuido_para_id = ?, status = 'em_andamento'
-      WHERE id = ?
-    `;
-    await pool.query(sql, [tecnicoId, chamadoId]);
 
-    // ⚡ Tempo real: notifica apenas o técnico atribuído
-    enviarParaUsuario(tecnicoId, 'chamado-atribuido', { chamadoId: Number(chamadoId) });
+  try {
+    // 1) Atualiza banco
+    await pool.query(
+      `UPDATE chamados SET atribuido_para_id = ?, status = 'em_andamento' WHERE id = ?`,
+      [tecnicoId, chamadoId]
+    );
+
+    // 2) Busca nomes envolvidos
+    const [[ch]] = await pool.query(
+      `SELECT c.criado_por_id, p.nome_completo AS tecnico_nome
+       FROM chamados c
+       JOIN perfis p ON p.id = ?
+       WHERE c.id = ?`,
+      [tecnicoId, chamadoId]
+    );
+
+    const tecnicoNome = ch.tecnico_nome;
+    const criadorId = ch.criado_por_id;
+
+    // 3) Notifica técnico
+    enviarParaUsuario(tecnicoId, 'chamado-atribuido', {
+      chamadoId: Number(chamadoId),
+      tipo: 'atribuido',
+      mensagem: `Você recebeu um novo chamado`,
+      tecnicoNome
+    });
+
+    // ✅ 4) Notifica funcionário criador
+    if (criadorId) {
+      enviarParaUsuario(criadorId, 'chamado-atribuido', {
+        chamadoId: Number(chamadoId),
+        tipo: 'atribuido',
+        mensagem: `Seu chamado foi atribuído ao técnico ${tecnicoNome}`,
+        tecnicoNome
+      });
+    }
 
     res.json({ message: 'Chamado atribuído com sucesso!' });
   } catch (err) {
